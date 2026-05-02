@@ -1645,11 +1645,29 @@ def extract_verilog(path: Path) -> dict:
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
+    def _first_descendant_of_type(node, wanted: tuple[str, ...]):
+        for child in node.children:
+            if child.type in wanted:
+                return child
+            found = _first_descendant_of_type(child, wanted)
+            if found is not None:
+                return found
+        return None
+
+    def _resolve_verilog_name(node, field_name: str, fallback_types: tuple[str, ...]):
+        named = node.child_by_field_name(field_name)
+        if named is not None:
+            return named
+        return _first_descendant_of_type(node, fallback_types)
+
+    def _module_name_from_header(node):
+        return _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
+
     def walk(node, module_nid: str | None = None) -> None:
         t = node.type
 
         if t == "module_declaration":
-            name_node = node.child_by_field_name("name")
+            name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
             if name_node:
                 mod_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
@@ -1661,7 +1679,7 @@ def extract_verilog(path: Path) -> dict:
                 return
 
         elif t in ("function_declaration", "function_prototype"):
-            name_node = node.child_by_field_name("name")
+            name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
             if name_node:
                 func_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
@@ -1671,7 +1689,7 @@ def extract_verilog(path: Path) -> dict:
                 add_edge(parent, nid, "contains", line)
 
         elif t == "task_declaration":
-            name_node = node.child_by_field_name("name")
+            name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
             if name_node:
                 task_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
@@ -1693,8 +1711,9 @@ def extract_verilog(path: Path) -> dict:
                         add_edge(src, tgt_nid, "imports_from", line)
 
         elif t == "module_instantiation":
-            # module_type instantiates another module
-            type_node = node.child_by_field_name("module_type")
+            # tree-sitter-verilog exposes the instantiated module type as the
+            # first identifier child rather than a named field in current releases.
+            type_node = _resolve_verilog_name(node, "module_type", ("simple_identifier", "escaped_identifier"))
             if type_node and module_nid:
                 inst_type = _read_text(type_node, source).strip()
                 if inst_type:
@@ -1706,7 +1725,20 @@ def extract_verilog(path: Path) -> dict:
         for child in node.children:
             walk(child, module_nid)
 
-    walk(root)
+    top_level_module_nid = None
+    if root.type == "ERROR":
+        for child in root.children:
+            if child.type == "module_header":
+                name_node = _module_name_from_header(child)
+                if name_node is not None:
+                    mod_name = _read_text(name_node, source)
+                    line = child.start_point[0] + 1
+                    top_level_module_nid = _make_id(stem, mod_name)
+                    add_node(top_level_module_nid, mod_name, line)
+                    add_edge(file_nid, top_level_module_nid, "defines", line)
+                    break
+
+    walk(root, top_level_module_nid)
     return {"nodes": nodes, "edges": edges}
 
 
