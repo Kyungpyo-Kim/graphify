@@ -28,6 +28,7 @@ def _file_stem(path: Path) -> str:
 
 
 _TSCONFIG_ALIAS_CACHE: dict[str, dict[str, str]] = {}
+_VERILOG_MODULE_NAME_CACHE: dict[str, set[str]] = {}
 
 
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
@@ -1628,6 +1629,8 @@ def extract_verilog(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
+    seen_edge_keys: set[tuple[str, str, str, int]] = set()
+    source_text = source.decode("utf-8", errors="replace")
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -1638,6 +1641,11 @@ def extract_verilog(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", score: float = 1.0) -> None:
+        dedupe_line = line if relation == "instantiates" else 0
+        edge_key = (src, tgt, relation, dedupe_line)
+        if edge_key in seen_edge_keys:
+            return
+        seen_edge_keys.add(edge_key)
         edges.append({"source": src, "target": tgt, "relation": relation,
                       "confidence": confidence, "confidence_score": score,
                       "source_file": str_path, "source_location": f"L{line}", "weight": 1.0})
@@ -1662,6 +1670,133 @@ def extract_verilog(path: Path) -> dict:
 
     def _module_name_from_header(node):
         return _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
+
+    def _mask_verilog_comments_and_strings(text: str) -> str:
+        pattern = re.compile(r'//.*?$|/\*.*?\*/|"(?:\\.|[^"\\])*"', re.MULTILINE | re.DOTALL)
+
+        def _preserve_layout(match: re.Match[str]) -> str:
+            return re.sub(r"[^\n]", " ", match.group(0))
+
+        return pattern.sub(_preserve_layout, text)
+
+    def _load_known_verilog_modules(search_root: Path) -> set[str]:
+        cache_key = str(search_root.resolve())
+        cached = _VERILOG_MODULE_NAME_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        module_name_re = re.compile(r"\b(?:module|macromodule)\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
+        names: set[str] = set()
+        try:
+            for ext in ("*.sv", "*.v"):
+                for candidate in search_root.rglob(ext):
+                    try:
+                        text = candidate.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    names.update(module_name_re.findall(_mask_verilog_comments_and_strings(text)))
+        except Exception:
+            pass
+
+        _VERILOG_MODULE_NAME_CACHE[cache_key] = names
+        return names
+
+    def _parse_verilog_instantiation_statement(stmt: str, blocked: set[str]) -> tuple[str, str] | None:
+        text = stmt.strip()
+        if not text or "(" not in text or not text.endswith(");"):
+            return None
+
+        if text.startswith("begin") or text.startswith("end"):
+            return None
+
+        label_match = re.match(r"^([A-Za-z_][A-Za-z0-9_$]*)\s*:\s*", text)
+        if label_match:
+            text = text[label_match.end():].lstrip()
+
+        type_match = re.match(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)", text)
+        if not type_match:
+            return None
+        inst_type = type_match.group(1)
+        if inst_type.lower() in blocked:
+            return None
+
+        idx = type_match.end()
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+
+        if idx < len(text) and text[idx] == '#':
+            idx += 1
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text) or text[idx] != '(':
+                return None
+            depth = 0
+            while idx < len(text):
+                ch = text[idx]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        idx += 1
+                        break
+                idx += 1
+            if depth != 0:
+                return None
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+
+        inst_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", text[idx:])
+        if not inst_match:
+            return None
+        inst_name = inst_match.group(1)
+        idx += inst_match.end()
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text) or text[idx] != '(':
+            return None
+        return inst_type, inst_name
+
+    def _extract_verilog_text_fallback() -> None:
+        masked_text = _mask_verilog_comments_and_strings(source_text)
+        module_re = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?P<body>.*?)(?:\bendmodule\b)", re.DOTALL)
+        blocked = {
+            "module", "macromodule", "function", "task", "if", "for", "while", "case",
+            "endcase", "assign", "assert", "assume", "cover", "property", "sequence", "always",
+            "always_ff", "always_comb", "always_latch", "wire", "logic", "reg", "input",
+            "output", "inout", "parameter", "localparam", "typedef", "return", "begin",
+            "else", "end", "default", "rand", "const", "virtual", "static", "unique", "priority",
+        }
+        known_modules = _load_known_verilog_modules(path.parent)
+
+        for module_match in module_re.finditer(masked_text):
+            mod_name = module_match.group(1)
+            body = module_match.group("body")
+            module_line = source_text.count("\n", 0, module_match.start(1)) + 1
+            module_nid = _make_id(stem, mod_name)
+            add_node(module_nid, mod_name, module_line)
+            add_edge(file_nid, module_nid, "defines", module_line)
+
+            body_offset = module_match.start("body")
+            for stmt_match in re.finditer(r"[^;]+;", body, re.DOTALL):
+                parsed = _parse_verilog_instantiation_statement(stmt_match.group(0), blocked)
+                if not parsed:
+                    continue
+                inst_type, _inst_name = parsed
+
+                is_known = inst_type in known_modules
+                looks_cell_like = (
+                    bool(re.fullmatch(r"[A-Z][A-Z0-9_$]*", inst_type))
+                    or inst_type.startswith("\\")
+                    or inst_type.startswith("prim_")
+                )
+                if not is_known and not looks_cell_like:
+                    continue
+
+                line = source_text.count("\n", 0, body_offset + stmt_match.start()) + 1
+                tgt_nid = _make_id(inst_type)
+                add_node(tgt_nid, inst_type, line)
+                add_edge(module_nid, tgt_nid, "instantiates", line, confidence="INFERRED", score=0.7)
 
     def walk(node, module_nid: str | None = None) -> None:
         t = node.type
@@ -1739,6 +1874,8 @@ def extract_verilog(path: Path) -> dict:
                     break
 
     walk(root, top_level_module_nid)
+    if root.type == "ERROR" or root.has_error:
+        _extract_verilog_text_fallback()
     return {"nodes": nodes, "edges": edges}
 
 
