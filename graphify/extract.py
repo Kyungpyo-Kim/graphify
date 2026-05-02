@@ -46,6 +46,7 @@ VERILOG_LABEL_PREFIX_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\s*:\s*")
 VERILOG_IDENTIFIER_RE = re.compile(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)")
 VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
 VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
+VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
 
 # SystemVerilog syntax/control keywords that must never be treated as inferred module types.
@@ -1658,6 +1659,8 @@ def extract_verilog(path: Path) -> dict:
     seen_ids: set[str] = set()
     seen_edge_keys: set[tuple[str, str, str, int]] = set()
     source_text = source.decode("utf-8", errors="replace")
+    local_callable_nodes: dict[str, dict[str, str]] = {}
+    callable_bodies: list[tuple[str, str, str, int]] = []
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -1790,6 +1793,28 @@ def extract_verilog(path: Path) -> dict:
 
         return None
 
+    def _register_local_callable(parent_nid: str, callable_name: str, callable_nid: str, node_text: str, line: int) -> None:
+        local_callable_nodes.setdefault(parent_nid, {})[callable_name] = callable_nid
+        body_text = node_text.split(";", 1)[1] if ";" in node_text else ""
+        if body_text:
+            callable_bodies.append((parent_nid, callable_nid, body_text, line))
+
+    def _extract_local_verilog_calls() -> None:
+        for parent_nid, caller_nid, body_text, line in callable_bodies:
+            masked_body = _mask_verilog_comments_and_strings(body_text)
+            local_targets = local_callable_nodes.get(parent_nid, {})
+            if not local_targets:
+                continue
+            for match in VERILOG_LOCAL_CALL_RE.finditer(masked_body):
+                callee_name = match.group(1)
+                if callee_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                    continue
+                callee_nid = local_targets.get(callee_name)
+                if callee_nid is None or callee_nid == caller_nid:
+                    continue
+                rel_line = line + body_text.count("\n", 0, match.start())
+                add_edge(caller_nid, callee_nid, "calls", rel_line)
+
     def _extract_verilog_text_fallback() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_modules = _load_known_verilog_modules(path.parent)
@@ -1843,6 +1868,7 @@ def extract_verilog(path: Path) -> dict:
                 nid = _make_id(parent, func_name)
                 add_node(nid, f"{func_name}()", line)
                 add_edge(parent, nid, "contains", line)
+                _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
 
         elif t == "task_declaration":
             name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
@@ -1853,6 +1879,7 @@ def extract_verilog(path: Path) -> dict:
                 nid = _make_id(parent, task_name)
                 add_node(nid, task_name, line)
                 add_edge(parent, nid, "contains", line)
+                _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
 
         elif t == "package_import_declaration":
             for child in node.children:
@@ -1895,6 +1922,7 @@ def extract_verilog(path: Path) -> dict:
                     break
 
     walk(root, top_level_module_nid)
+    _extract_local_verilog_calls()
     if root.type == "ERROR" or root.has_error:
         _extract_verilog_text_fallback()
     return {"nodes": nodes, "edges": edges}
