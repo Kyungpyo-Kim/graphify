@@ -30,6 +30,33 @@ def _file_stem(path: Path) -> str:
 _TSCONFIG_ALIAS_CACHE: dict[str, dict[str, str]] = {}
 _VERILOG_MODULE_NAME_CACHE: dict[str, set[str]] = {}
 
+VERILOG_COMMENT_OR_STRING_RE = re.compile(
+    r'//.*?$|/\*.*?\*/|"(?:\\.|[^"\\])*"',
+    re.MULTILINE | re.DOTALL,
+)
+VERILOG_MODULE_DECLARATION_RE = re.compile(
+    r"\b(?:module|macromodule)\s+([A-Za-z_][A-Za-z0-9_$]*)\b"
+)
+VERILOG_MODULE_BODY_RE = re.compile(
+    r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?P<body>.*?)(?:\bendmodule\b)",
+    re.DOTALL,
+)
+VERILOG_STATEMENT_RE = re.compile(r"[^;]+;", re.DOTALL)
+VERILOG_LABEL_PREFIX_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\s*:\s*")
+VERILOG_IDENTIFIER_RE = re.compile(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)")
+VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
+VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
+VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
+
+# SystemVerilog syntax/control keywords that must never be treated as inferred module types.
+SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS = frozenset({
+    "module", "macromodule", "function", "task", "if", "for", "while", "case",
+    "endcase", "assign", "assert", "assume", "cover", "property", "sequence", "always",
+    "always_ff", "always_comb", "always_latch", "wire", "logic", "reg", "input",
+    "output", "inout", "parameter", "localparam", "typedef", "return", "begin",
+    "else", "end", "default", "rand", "const", "virtual", "static", "unique", "priority",
+})
+
 
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
     """Walk up from start_dir to find tsconfig.json and return compilerOptions.paths aliases.
@@ -1672,12 +1699,10 @@ def extract_verilog(path: Path) -> dict:
         return _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
 
     def _mask_verilog_comments_and_strings(text: str) -> str:
-        pattern = re.compile(r'//.*?$|/\*.*?\*/|"(?:\\.|[^"\\])*"', re.MULTILINE | re.DOTALL)
-
         def _preserve_layout(match: re.Match[str]) -> str:
             return re.sub(r"[^\n]", " ", match.group(0))
 
-        return pattern.sub(_preserve_layout, text)
+        return VERILOG_COMMENT_OR_STRING_RE.sub(_preserve_layout, text)
 
     def _load_known_verilog_modules(search_root: Path) -> set[str]:
         cache_key = str(search_root.resolve())
@@ -1685,7 +1710,6 @@ def extract_verilog(path: Path) -> dict:
         if cached is not None:
             return cached
 
-        module_name_re = re.compile(r"\b(?:module|macromodule)\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
         names: set[str] = set()
         try:
             for ext in ("*.sv", "*.v"):
@@ -1694,14 +1718,14 @@ def extract_verilog(path: Path) -> dict:
                         text = candidate.read_text(encoding="utf-8", errors="replace")
                     except Exception:
                         continue
-                    names.update(module_name_re.findall(_mask_verilog_comments_and_strings(text)))
+                    names.update(VERILOG_MODULE_DECLARATION_RE.findall(_mask_verilog_comments_and_strings(text)))
         except Exception:
             pass
 
         _VERILOG_MODULE_NAME_CACHE[cache_key] = names
         return names
 
-    def _parse_verilog_instantiation_statement(stmt: str, blocked: set[str]) -> tuple[str, str] | None:
+    def _parse_verilog_instantiation_statement(stmt: str, blocked_keywords: frozenset[str]) -> tuple[str, str] | None:
         text = stmt.strip()
         if not text or "(" not in text or not text.endswith(");"):
             return None
@@ -1709,15 +1733,15 @@ def extract_verilog(path: Path) -> dict:
         if text.startswith("begin") or text.startswith("end"):
             return None
 
-        label_match = re.match(r"^([A-Za-z_][A-Za-z0-9_$]*)\s*:\s*", text)
+        label_match = VERILOG_LABEL_PREFIX_RE.match(text)
         if label_match:
             text = text[label_match.end():].lstrip()
 
-        type_match = re.match(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)", text)
+        type_match = VERILOG_IDENTIFIER_RE.match(text)
         if not type_match:
             return None
         inst_type = type_match.group(1)
-        if inst_type.lower() in blocked:
+        if inst_type.lower() in blocked_keywords:
             return None
 
         idx = type_match.end()
@@ -1746,7 +1770,7 @@ def extract_verilog(path: Path) -> dict:
             while idx < len(text) and text[idx].isspace():
                 idx += 1
 
-        inst_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", text[idx:])
+        inst_match = VERILOG_INSTANCE_NAME_RE.match(text[idx:])
         if not inst_match:
             return None
         inst_name = inst_match.group(1)
@@ -1757,19 +1781,20 @@ def extract_verilog(path: Path) -> dict:
             return None
         return inst_type, inst_name
 
+    def _classify_inferred_verilog_target(inst_type: str, known_modules: set[str]) -> tuple[str, str, float] | None:
+        if inst_type in known_modules:
+            return ("instantiates", "INFERRED", 0.7)
+
+        if inst_type.startswith("\\") or VERILOG_CELL_LIKE_NAME_RE.fullmatch(inst_type):
+            return (VERILOG_EXTERNAL_REFERENCE_RELATION, "UNRESOLVED_EXTERNAL", 0.35)
+
+        return None
+
     def _extract_verilog_text_fallback() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
-        module_re = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?P<body>.*?)(?:\bendmodule\b)", re.DOTALL)
-        blocked = {
-            "module", "macromodule", "function", "task", "if", "for", "while", "case",
-            "endcase", "assign", "assert", "assume", "cover", "property", "sequence", "always",
-            "always_ff", "always_comb", "always_latch", "wire", "logic", "reg", "input",
-            "output", "inout", "parameter", "localparam", "typedef", "return", "begin",
-            "else", "end", "default", "rand", "const", "virtual", "static", "unique", "priority",
-        }
         known_modules = _load_known_verilog_modules(path.parent)
 
-        for module_match in module_re.finditer(masked_text):
+        for module_match in VERILOG_MODULE_BODY_RE.finditer(masked_text):
             mod_name = module_match.group(1)
             body = module_match.group("body")
             module_line = source_text.count("\n", 0, module_match.start(1)) + 1
@@ -1778,25 +1803,21 @@ def extract_verilog(path: Path) -> dict:
             add_edge(file_nid, module_nid, "defines", module_line)
 
             body_offset = module_match.start("body")
-            for stmt_match in re.finditer(r"[^;]+;", body, re.DOTALL):
-                parsed = _parse_verilog_instantiation_statement(stmt_match.group(0), blocked)
+            for stmt_match in VERILOG_STATEMENT_RE.finditer(body):
+                parsed = _parse_verilog_instantiation_statement(stmt_match.group(0), SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS)
                 if not parsed:
                     continue
                 inst_type, _inst_name = parsed
 
-                is_known = inst_type in known_modules
-                looks_cell_like = (
-                    bool(re.fullmatch(r"[A-Z][A-Z0-9_$]*", inst_type))
-                    or inst_type.startswith("\\")
-                    or inst_type.startswith("prim_")
-                )
-                if not is_known and not looks_cell_like:
+                classification = _classify_inferred_verilog_target(inst_type, known_modules)
+                if classification is None:
                     continue
+                relation, confidence, score = classification
 
                 line = source_text.count("\n", 0, body_offset + stmt_match.start()) + 1
                 tgt_nid = _make_id(inst_type)
                 add_node(tgt_nid, inst_type, line)
-                add_edge(module_nid, tgt_nid, "instantiates", line, confidence="INFERRED", score=0.7)
+                add_edge(module_nid, tgt_nid, relation, line, confidence=confidence, score=score)
 
     def walk(node, module_nid: str | None = None) -> None:
         t = node.type
