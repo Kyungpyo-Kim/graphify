@@ -17,7 +17,7 @@ _MAX_FETCH_BYTES = 52_428_800   # 50 MB hard cap for binary downloads
 _MAX_TEXT_BYTES  = 10_485_760   # 10 MB hard cap for HTML / text
 
 # AWS metadata, link-local, and common cloud metadata endpoints
-_BLOCKED_HOSTS = {"metadata.google.internal", "metadata.google.com"}
+_BLOCKED_HOSTS = {"metadata.google.internal", "metadata.google.com", "localhost"}
 
 
 # ---------------------------------------------------------------------------
@@ -41,28 +41,25 @@ def validate_url(url: str) -> str:
 
     hostname = parsed.hostname
     if hostname:
-        # Block known cloud metadata hostnames
+        # Block known cloud metadata hostnames and local-only aliases without DNS.
         if hostname.lower() in _BLOCKED_HOSTS:
             raise ValueError(
                 f"Blocked cloud metadata endpoint '{hostname}'. "
                 f"Got: {url!r}"
             )
 
-        # Resolve hostname and block private/reserved IP ranges
+        # Only validate literal IPs here. Hostname DNS resolution is deferred to the
+        # actual fetch path so validation stays deterministic in offline test/CI runs.
         try:
-            infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            for info in infos:
-                addr = info[4][0]
-                ip = ipaddress.ip_address(addr)
-                if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
-                    raise ValueError(
-                        f"Blocked private/internal IP {addr} (resolved from '{hostname}'). "
-                        f"Got: {url!r}"
-                    )
-        except socket.gaierror as exc:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            ip = None
+
+        if ip and (ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local):
             raise ValueError(
-                f"DNS resolution failed for '{hostname}': {exc}. Got: {url!r}"
-            ) from exc
+                f"Blocked private/internal IP {hostname}. "
+                f"Got: {url!r}"
+            )
 
     return url
 
