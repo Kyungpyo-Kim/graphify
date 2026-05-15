@@ -47,6 +47,7 @@ VERILOG_IDENTIFIER_RE = re.compile(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)")
 VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
 VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
 VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
+VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_][A-Za-z0-9_$]*)\b")
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
 
 # SystemVerilog syntax/control keywords that must never be treated as inferred module types.
@@ -1661,6 +1662,8 @@ def extract_verilog(path: Path) -> dict:
     source_text = source.decode("utf-8", errors="replace")
     local_callable_nodes: dict[str, dict[str, str]] = {}
     callable_bodies: list[tuple[str, str, str, int]] = []
+    scope_ranges: list[tuple[int, int, str, int]] = []
+    package_import_ranges: list[tuple[int, int]] = []
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -1815,6 +1818,34 @@ def extract_verilog(path: Path) -> dict:
                 rel_line = line + body_text.count("\n", 0, match.start())
                 add_edge(caller_nid, callee_nid, "calls", rel_line)
 
+    def _resolve_scope_for_byte(byte_offset: int) -> tuple[str, int]:
+        best_scope = (file_nid, 1)
+        best_span = None
+        for start_byte, end_byte, scope_nid, scope_line in scope_ranges:
+            if start_byte <= byte_offset < end_byte:
+                span = end_byte - start_byte
+                if best_span is None or span < best_span:
+                    best_scope = (scope_nid, scope_line)
+                    best_span = span
+        return best_scope
+
+    def _extract_package_qualified_symbol_uses() -> None:
+        masked_text = _mask_verilog_comments_and_strings(source_text)
+        for match in VERILOG_PACKAGE_SYMBOL_RE.finditer(masked_text):
+            if any(start <= match.start() < end for start, end in package_import_ranges):
+                continue
+            pkg_name, symbol_name = match.groups()
+            if symbol_name == "*":
+                continue
+            src_nid, src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            pkg_nid = _make_id(pkg_name)
+            symbol_nid = _make_id(pkg_name, symbol_name)
+            add_node(pkg_nid, pkg_name, line)
+            add_node(symbol_nid, f"{pkg_name}::{symbol_name}", line)
+            add_edge(symbol_nid, pkg_nid, "qualified_by_package", line)
+            add_edge(src_nid, symbol_nid, "uses_package_symbol", line)
+
     def _extract_verilog_text_fallback() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_modules = _load_known_verilog_modules(path.parent)
@@ -1855,12 +1886,17 @@ def extract_verilog(path: Path) -> dict:
                 nid = _make_id(stem, mod_name)
                 add_node(nid, mod_name, line)
                 add_edge(file_nid, nid, "defines", line)
+                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
                 for child in node.children:
                     walk(child, nid)
                 return
 
         elif t in ("function_declaration", "function_prototype"):
-            name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                name_node = _first_descendant_of_type(node, ("function_identifier",))
+            if name_node is None:
+                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
             if name_node:
                 func_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
@@ -1868,10 +1904,15 @@ def extract_verilog(path: Path) -> dict:
                 nid = _make_id(parent, func_name)
                 add_node(nid, f"{func_name}()", line)
                 add_edge(parent, nid, "contains", line)
+                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
                 _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
 
         elif t == "task_declaration":
-            name_node = _resolve_verilog_name(node, "name", ("simple_identifier", "escaped_identifier"))
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                name_node = _first_descendant_of_type(node, ("task_identifier",))
+            if name_node is None:
+                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
             if name_node:
                 task_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
@@ -1879,6 +1920,7 @@ def extract_verilog(path: Path) -> dict:
                 nid = _make_id(parent, task_name)
                 add_node(nid, task_name, line)
                 add_edge(parent, nid, "contains", line)
+                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
                 _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
 
         elif t == "package_import_declaration":
@@ -1892,6 +1934,7 @@ def extract_verilog(path: Path) -> dict:
                         add_node(tgt_nid, pkg_name, line)
                         src = module_nid or file_nid
                         add_edge(src, tgt_nid, "imports_from", line)
+                        package_import_ranges.append((node.start_byte, node.end_byte))
 
         elif t == "module_instantiation":
             # tree-sitter-verilog exposes the instantiated module type as the
@@ -1923,6 +1966,7 @@ def extract_verilog(path: Path) -> dict:
 
     walk(root, top_level_module_nid)
     _extract_local_verilog_calls()
+    _extract_package_qualified_symbol_uses()
     if root.type == "ERROR" or root.has_error:
         _extract_verilog_text_fallback()
     return {"nodes": nodes, "edges": edges}
