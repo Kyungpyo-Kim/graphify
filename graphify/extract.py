@@ -48,7 +48,15 @@ VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
 VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
 VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_][A-Za-z0-9_$]*)\b")
+VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
+VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
+VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)")
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
+VERILOG_SIGNAL_DECLARATION_TYPES = frozenset({
+    "ansi_port_declaration",
+    "net_declaration",
+    "data_declaration",
+})
 
 # SystemVerilog syntax/control keywords that must never be treated as inferred module types.
 SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS = frozenset({
@@ -1802,6 +1810,113 @@ def extract_verilog(path: Path) -> dict:
         if body_text:
             callable_bodies.append((parent_nid, callable_nid, body_text, line))
 
+    def _signal_nid(scope_nid: str, signal_name: str) -> str:
+        return _make_id(scope_nid, signal_name)
+
+    def _ensure_scope_signal(scope_nid: str, signal_name: str, line: int) -> str:
+        nid = _signal_nid(scope_nid, signal_name)
+        add_node(nid, signal_name, line)
+        add_edge(scope_nid, nid, "contains", line)
+        return nid
+
+    def _extract_signal_identifiers(node) -> list[Any]:
+        identifiers: list[Any] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type in ("simple_identifier", "escaped_identifier"):
+                identifiers.append(current)
+                continue
+            stack.extend(reversed(current.children))
+        return identifiers
+
+    def _extract_simple_signal_expression_identifier(node):
+        if node is None:
+            return None
+        if node.type in ("simple_identifier", "escaped_identifier"):
+            return node
+        for child in node.children:
+            found = _extract_simple_signal_expression_identifier(child)
+            if found is not None:
+                return found
+        return None
+
+    def _register_verilog_signal_declaration(node, scope_nid: str) -> None:
+        line = node.start_point[0] + 1
+        seen_signal_names: set[str] = set()
+        for ident in _extract_signal_identifiers(node):
+            signal_name = _read_text(ident, source).strip()
+            if not signal_name or signal_name in seen_signal_names:
+                continue
+            seen_signal_names.add(signal_name)
+            _ensure_scope_signal(scope_nid, signal_name, line)
+
+    def _extract_verilog_signal_connectivity(node, scope_nid: str) -> None:
+        if node.type == "continuous_assign":
+            line = node.start_point[0] + 1
+            for child in node.children:
+                if child.type != "list_of_net_assignments":
+                    continue
+                for assignment in child.children:
+                    if assignment.type != "net_assignment":
+                        continue
+                    lhs = assignment.child_by_field_name("left")
+                    rhs = assignment.child_by_field_name("right")
+                    lhs_ident = _extract_simple_signal_expression_identifier(lhs)
+                    if lhs_ident is None:
+                        continue
+                    lhs_name = _read_text(lhs_ident, source).strip()
+                    lhs_nid = _ensure_scope_signal(scope_nid, lhs_name, line)
+                    rhs_seen: set[str] = set()
+                    if rhs is None:
+                        continue
+                    for rhs_ident in _extract_signal_identifiers(rhs):
+                        rhs_name = _read_text(rhs_ident, source).strip()
+                        if not rhs_name or rhs_name == lhs_name or rhs_name in rhs_seen:
+                            continue
+                        rhs_seen.add(rhs_name)
+                        rhs_nid = _ensure_scope_signal(scope_nid, rhs_name, line)
+                        add_edge(lhs_nid, rhs_nid, "depends_on_signal", line)
+            return
+
+        if node.type == "module_instantiation":
+            line = node.start_point[0] + 1
+            type_node = _resolve_verilog_name(node, "module_type", ("simple_identifier", "escaped_identifier"))
+            inst_type = _read_text(type_node, source).strip() if type_node is not None else "instance"
+            for child in node.children:
+                if child.type != "hierarchical_instance":
+                    continue
+                name_node = _resolve_verilog_name(child, "name", ("instance_identifier", "simple_identifier", "escaped_identifier"))
+                if name_node is None:
+                    continue
+                inst_name = _read_text(name_node, source).strip()
+                inst_nid = _make_id(scope_nid, inst_name)
+                add_node(inst_nid, f"{inst_name}:{inst_type}", line)
+                add_edge(scope_nid, inst_nid, "contains", line)
+                for port_list in child.children:
+                    if port_list.type != "list_of_port_connections":
+                        continue
+                    for port_conn in port_list.children:
+                        if port_conn.type != "named_port_connection":
+                            continue
+                        port_node = _resolve_verilog_name(port_conn, "port", ("port_identifier", "simple_identifier", "escaped_identifier"))
+                        if port_node is None:
+                            port_node = _first_descendant_of_type(port_conn, ("port_identifier", "simple_identifier", "escaped_identifier"))
+                        expr_node = port_conn.child_by_field_name("expression")
+                        if expr_node is None:
+                            expr_node = _first_descendant_of_type(port_conn, ("expression",))
+                        signal_ident = _extract_simple_signal_expression_identifier(expr_node)
+                        if port_node is None or signal_ident is None:
+                            continue
+                        port_name = _read_text(port_node, source).strip()
+                        signal_name = _read_text(signal_ident, source).strip()
+                        signal_nid = _ensure_scope_signal(scope_nid, signal_name, line)
+                        endpoint_nid = _make_id(inst_nid, port_name)
+                        add_node(endpoint_nid, f"{inst_name}.{port_name}", line)
+                        add_edge(inst_nid, endpoint_nid, "has_port_binding", line)
+                        add_edge(signal_nid, endpoint_nid, "binds_port", line)
+            return
+
     def _extract_local_verilog_calls() -> None:
         for parent_nid, caller_nid, body_text, line in callable_bodies:
             masked_body = _mask_verilog_comments_and_strings(body_text)
@@ -1845,6 +1960,61 @@ def extract_verilog(path: Path) -> dict:
             add_node(symbol_nid, f"{pkg_name}::{symbol_name}", line)
             add_edge(symbol_nid, pkg_nid, "qualified_by_package", line)
             add_edge(src_nid, symbol_nid, "uses_package_symbol", line)
+
+    def _extract_simple_assign_signal_dependencies() -> None:
+        masked_text = _mask_verilog_comments_and_strings(source_text)
+        for module_match in VERILOG_MODULE_BODY_RE.finditer(masked_text):
+            mod_name = module_match.group(1)
+            body = module_match.group("body")
+            body_offset = module_match.start("body")
+            module_nid = _make_id(stem, mod_name)
+
+            for stmt_match in VERILOG_STATEMENT_RE.finditer(body):
+                stmt_text = stmt_match.group(0)
+                line = source_text.count("\n", 0, body_offset + stmt_match.start()) + 1
+
+                assign_match = VERILOG_SIMPLE_ASSIGN_RE.search(stmt_text)
+                if assign_match:
+                    lhs_identifiers = [
+                        m.group(1)
+                        for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assign_match.group("lhs"))
+                        if m.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
+                    ]
+                    if lhs_identifiers:
+                        lhs_name = lhs_identifiers[-1]
+                        lhs_signal_nid = _make_id(module_nid, lhs_name)
+                        add_node(lhs_signal_nid, lhs_name, line)
+                        add_edge(module_nid, lhs_signal_nid, "contains", line)
+
+                        seen_rhs: set[str] = set()
+                        for rhs_match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assign_match.group("rhs")):
+                            rhs_name = rhs_match.group(1)
+                            if rhs_name == lhs_name or rhs_name in seen_rhs:
+                                continue
+                            if rhs_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            seen_rhs.add(rhs_name)
+                            rhs_signal_nid = _make_id(module_nid, rhs_name)
+                            add_node(rhs_signal_nid, rhs_name, line)
+                            add_edge(module_nid, rhs_signal_nid, "contains", line)
+                            add_edge(rhs_signal_nid, lhs_signal_nid, "assigns_to", line)
+                    continue
+
+                parsed_instantiation = _parse_verilog_instantiation_statement(stmt_text, SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS)
+                if not parsed_instantiation:
+                    continue
+                _inst_type, inst_name = parsed_instantiation
+                for port_match in VERILOG_NAMED_PORT_BINDING_RE.finditer(stmt_text):
+                    port_name, signal_name = port_match.groups()
+                    if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                        continue
+                    signal_nid = _make_id(module_nid, signal_name)
+                    port_nid = _make_id(module_nid, inst_name, port_name)
+                    add_node(signal_nid, signal_name, line)
+                    add_node(port_nid, f"{inst_name}.{port_name}", line)
+                    add_edge(module_nid, signal_nid, "contains", line)
+                    add_edge(module_nid, port_nid, "contains", line)
+                    add_edge(signal_nid, port_nid, "binds_port", line)
 
     def _extract_verilog_text_fallback() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
@@ -1923,6 +2093,10 @@ def extract_verilog(path: Path) -> dict:
                 scope_ranges.append((node.start_byte, node.end_byte, nid, line))
                 _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
 
+        elif t in VERILOG_SIGNAL_DECLARATION_TYPES:
+            if module_nid:
+                _register_verilog_signal_declaration(node, module_nid)
+
         elif t == "package_import_declaration":
             for child in node.children:
                 if child.type == "package_import_item":
@@ -1947,6 +2121,11 @@ def extract_verilog(path: Path) -> dict:
                     tgt_nid = _make_id(inst_type)
                     add_node(tgt_nid, inst_type, line)
                     add_edge(module_nid, tgt_nid, "instantiates", line)
+                _extract_verilog_signal_connectivity(node, module_nid)
+
+        elif t == "continuous_assign":
+            if module_nid:
+                _extract_verilog_signal_connectivity(node, module_nid)
 
         for child in node.children:
             walk(child, module_nid)
@@ -1967,6 +2146,7 @@ def extract_verilog(path: Path) -> dict:
     walk(root, top_level_module_nid)
     _extract_local_verilog_calls()
     _extract_package_qualified_symbol_uses()
+    _extract_simple_assign_signal_dependencies()
     if root.type == "ERROR" or root.has_error:
         _extract_verilog_text_fallback()
     return {"nodes": nodes, "edges": edges}
