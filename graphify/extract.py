@@ -41,6 +41,10 @@ VERILOG_MODULE_BODY_RE = re.compile(
     r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?P<body>.*?)(?:\bendmodule\b)",
     re.DOTALL,
 )
+VERILOG_MODULE_HEADER_PORTS_RE = re.compile(
+    r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?:\s*#\s*\(.*?\))?\s*\((?P<ports>.*?)\)\s*;",
+    re.DOTALL,
+)
 VERILOG_STATEMENT_RE = re.compile(r"[^;]+;", re.DOTALL)
 VERILOG_LABEL_PREFIX_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\s*:\s*")
 VERILOG_IDENTIFIER_RE = re.compile(r"^([A-Za-z_\\][A-Za-z0-9_$:]*)")
@@ -1739,6 +1743,33 @@ def extract_verilog(path: Path) -> dict:
         _VERILOG_MODULE_NAME_CACHE[cache_key] = names
         return names
 
+    def _load_known_verilog_module_ports(search_root: Path) -> dict[str, list[str]]:
+        module_ports: dict[str, list[str]] = {}
+        try:
+            for ext in ("*.sv", "*.v"):
+                for candidate in search_root.rglob(ext):
+                    try:
+                        text = candidate.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    masked = _mask_verilog_comments_and_strings(text)
+                    for match in VERILOG_MODULE_HEADER_PORTS_RE.finditer(masked):
+                        module_name = match.group(1)
+                        ports_text = match.group("ports")
+                        ports: list[str] = []
+                        for port_match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_$]*)\b", ports_text):
+                            token = port_match.group(1)
+                            if token.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            if token in {"logic", "wire", "reg", "signed", "unsigned"}:
+                                continue
+                            ports.append(token)
+                        if ports:
+                            module_ports[module_name] = ports
+        except Exception:
+            pass
+        return module_ports
+
     def _parse_verilog_instantiation_statement(stmt: str, blocked_keywords: frozenset[str]) -> tuple[str, str] | None:
         text = stmt.strip()
         if not text or "(" not in text or not text.endswith(");"):
@@ -1818,6 +1849,50 @@ def extract_verilog(path: Path) -> dict:
         add_node(nid, signal_name, line)
         add_edge(scope_nid, nid, "contains", line)
         return nid
+
+    def _split_verilog_top_level_commas(text: str) -> list[str]:
+        parts: list[str] = []
+        current: list[str] = []
+        depth = 0
+        for ch in text:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(0, depth - 1)
+            if ch == ',' and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+            current.append(ch)
+        tail = "".join(current).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _extract_instantiation_port_bindings(stmt_text: str, inst_name: str, inst_type: str, module_ports: dict[str, list[str]]) -> list[tuple[str, str]]:
+        named_bindings = list(VERILOG_NAMED_PORT_BINDING_RE.finditer(stmt_text))
+        if named_bindings:
+            return [(match.group(1), match.group(2)) for match in named_bindings]
+
+        inst_match = re.search(rf"\b{re.escape(inst_name)}\s*\((.*)\)\s*;\s*$", stmt_text, re.DOTALL)
+        if inst_match is None:
+            return []
+        ordered_ports = module_ports.get(inst_type, [])
+        if not ordered_ports:
+            return []
+
+        bindings: list[tuple[str, str]] = []
+        for index, arg_text in enumerate(_split_verilog_top_level_commas(inst_match.group(1))):
+            if index >= len(ordered_ports):
+                break
+            signal_match = VERILOG_SIGNAL_IDENTIFIER_RE.fullmatch(arg_text.strip())
+            if signal_match is None:
+                continue
+            signal_name = signal_match.group(1)
+            if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                continue
+            bindings.append((ordered_ports[index], signal_name))
+        return bindings
 
     def _extract_signal_identifiers(node) -> list[Any]:
         identifiers: list[Any] = []
@@ -1963,6 +2038,7 @@ def extract_verilog(path: Path) -> dict:
 
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
+        known_module_ports = _load_known_verilog_module_ports(path.parent)
         for module_match in VERILOG_MODULE_BODY_RE.finditer(masked_text):
             mod_name = module_match.group(1)
             body = module_match.group("body")
@@ -2003,9 +2079,8 @@ def extract_verilog(path: Path) -> dict:
                 parsed_instantiation = _parse_verilog_instantiation_statement(stmt_text, SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS)
                 if not parsed_instantiation:
                     continue
-                _inst_type, inst_name = parsed_instantiation
-                for port_match in VERILOG_NAMED_PORT_BINDING_RE.finditer(stmt_text):
-                    port_name, signal_name = port_match.groups()
+                inst_type, inst_name = parsed_instantiation
+                for port_name, signal_name in _extract_instantiation_port_bindings(stmt_text, inst_name, inst_type, known_module_ports):
                     if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
                         continue
                     signal_nid = _make_id(module_nid, signal_name)
