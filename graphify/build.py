@@ -99,6 +99,22 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
         # causing display functions to show edges backwards.
         attrs["_src"] = src
         attrs["_tgt"] = tgt
+        if G.has_edge(src, tgt):
+            existing = G.edges[src, tgt]
+            if existing.get("relation") == attrs.get("relation"):
+                existing["weight"] = float(existing.get("weight", 1.0)) + float(attrs.get("weight", 1.0))
+                existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
+                if "source_location" in attrs:
+                    existing_locations = existing.get("source_locations")
+                    if existing_locations is None:
+                        existing_locations = []
+                        first_location = existing.get("source_location")
+                        if first_location:
+                            existing_locations.append(first_location)
+                    if attrs["source_location"] not in existing_locations:
+                        existing_locations.append(attrs["source_location"])
+                    existing["source_locations"] = existing_locations
+                continue
         G.add_edge(src, tgt, **attrs)
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:

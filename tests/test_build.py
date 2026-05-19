@@ -60,3 +60,41 @@ def test_build_merges_multiple_extractions():
     G = build([ext1, ext2])
     assert G.number_of_nodes() == 2
     assert G.number_of_edges() == 1
+
+
+def test_build_from_json_aggregates_repeated_same_relation_edges():
+    ext = {
+        "nodes": [
+            {"id": "top", "label": "top", "file_type": "code", "source_file": "top.sv"},
+            {"id": "child", "label": "child", "file_type": "code", "source_file": "top.sv"},
+        ],
+        "edges": [
+            {
+                "source": "top",
+                "target": "child",
+                "relation": "instantiates",
+                "confidence": "EXTRACTED",
+                "source_file": "top.sv",
+                "source_location": "L10",
+                "weight": 1.0,
+            },
+            {
+                "source": "top",
+                "target": "child",
+                "relation": "instantiates",
+                "confidence": "EXTRACTED",
+                "source_file": "top.sv",
+                "source_location": "L20",
+                "weight": 1.0,
+            },
+        ],
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    G = build_from_json(ext, directed=True)
+    assert G.number_of_edges() == 1
+    data = G.edges["top", "child"]
+    assert data["relation"] == "instantiates"
+    assert data["weight"] == 2.0
+    assert data["occurrence_count"] == 2
+    assert data["source_locations"] == ["L10", "L20"]
