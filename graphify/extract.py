@@ -53,6 +53,7 @@ VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
 VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_][A-Za-z0-9_$]*)\b")
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
+VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
 VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)")
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
@@ -70,6 +71,29 @@ SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS = frozenset({
     "output", "inout", "parameter", "localparam", "typedef", "return", "begin",
     "else", "end", "default", "rand", "const", "virtual", "static", "unique", "priority",
 })
+VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES = (
+    "wire ",
+    "logic ",
+    "reg ",
+    "bit ",
+    "byte ",
+    "shortint ",
+    "int ",
+    "longint ",
+    "integer ",
+    "time ",
+    "realtime ",
+    "shortreal ",
+    "real ",
+    "string ",
+    "event ",
+    "const ",
+    "var ",
+    "rand ",
+    "localparam ",
+    "parameter ",
+    "typedef ",
+)
 
 
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
@@ -2050,10 +2074,18 @@ def extract_verilog(path: Path) -> dict:
                 line = source_text.count("\n", 0, body_offset + stmt_match.start()) + 1
 
                 assign_match = VERILOG_SIMPLE_ASSIGN_RE.search(stmt_text)
-                if assign_match:
+                procedural_match = None
+                if assign_match is None:
+                    stripped_stmt = stmt_text.strip()
+                    lowered_stmt = stripped_stmt.lower()
+                    if not any(lowered_stmt.startswith(prefix) for prefix in VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES):
+                        procedural_match = VERILOG_PROCEDURAL_ASSIGN_RE.search(stmt_text)
+
+                assignment_match = assign_match or procedural_match
+                if assignment_match:
                     lhs_identifiers = [
                         m.group(1)
-                        for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assign_match.group("lhs"))
+                        for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("lhs"))
                         if m.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
                     ]
                     if lhs_identifiers:
@@ -2063,7 +2095,7 @@ def extract_verilog(path: Path) -> dict:
                         add_edge(module_nid, lhs_signal_nid, "contains", line)
 
                         seen_rhs: set[str] = set()
-                        for rhs_match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assign_match.group("rhs")):
+                        for rhs_match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("rhs")):
                             rhs_name = rhs_match.group(1)
                             if rhs_name == lhs_name or rhs_name in seen_rhs:
                                 continue
