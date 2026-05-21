@@ -2094,14 +2094,24 @@ def extract_verilog(path: Path) -> dict:
                         add_node(lhs_signal_nid, lhs_name, line)
                         add_edge(module_nid, lhs_signal_nid, "contains", line)
 
-                        seen_rhs: set[str] = set()
+                        seen_dependencies: set[str] = set()
+                        if procedural_match is not None:
+                            for control_name in lhs_identifiers[:-1]:
+                                if control_name == lhs_name or control_name in seen_dependencies:
+                                    continue
+                                seen_dependencies.add(control_name)
+                                control_signal_nid = _make_id(module_nid, control_name)
+                                add_node(control_signal_nid, control_name, line)
+                                add_edge(module_nid, control_signal_nid, "contains", line)
+                                add_edge(control_signal_nid, lhs_signal_nid, "assigns_to", line)
+
                         for rhs_match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("rhs")):
                             rhs_name = rhs_match.group(1)
-                            if rhs_name == lhs_name or rhs_name in seen_rhs:
+                            if rhs_name == lhs_name or rhs_name in seen_dependencies:
                                 continue
                             if rhs_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
                                 continue
-                            seen_rhs.add(rhs_name)
+                            seen_dependencies.add(rhs_name)
                             rhs_signal_nid = _make_id(module_nid, rhs_name)
                             add_node(rhs_signal_nid, rhs_name, line)
                             add_edge(module_nid, rhs_signal_nid, "contains", line)
