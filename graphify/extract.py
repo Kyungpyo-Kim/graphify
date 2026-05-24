@@ -2060,6 +2060,10 @@ def extract_verilog(path: Path) -> dict:
             add_edge(symbol_nid, pkg_nid, "qualified_by_package", line)
             add_edge(src_nid, symbol_nid, "uses_package_symbol", line)
 
+    def _is_verilog_numeric_literal_identifier(text: str, match: re.Match[str]) -> bool:
+        start = match.start(1)
+        return start >= 2 and text[start - 1] == "'" and text[start - 2].isdigit()
+
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_module_ports = _load_known_verilog_module_ports(path.parent)
@@ -2087,6 +2091,7 @@ def extract_verilog(path: Path) -> dict:
                         m.group(1)
                         for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("lhs"))
                         if m.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
+                        and not _is_verilog_numeric_literal_identifier(assignment_match.group("lhs"), m)
                     ]
                     if lhs_identifiers:
                         lhs_name = lhs_identifiers[-1]
@@ -2110,6 +2115,8 @@ def extract_verilog(path: Path) -> dict:
                             if rhs_name == lhs_name or rhs_name in seen_dependencies:
                                 continue
                             if rhs_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            if _is_verilog_numeric_literal_identifier(assignment_match.group("rhs"), rhs_match):
                                 continue
                             seen_dependencies.add(rhs_name)
                             rhs_signal_nid = _make_id(module_nid, rhs_name)
