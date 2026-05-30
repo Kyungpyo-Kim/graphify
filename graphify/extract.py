@@ -55,7 +55,7 @@ VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_]
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
-VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)")
+VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\((?P<expr>.*?)\)", re.DOTALL)
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
 VERILOG_SIGNAL_DECLARATION_TYPES = frozenset({
     "ansi_port_declaration",
@@ -1893,10 +1893,30 @@ def extract_verilog(path: Path) -> dict:
             parts.append(tail)
         return parts
 
+    def _extract_signal_names_from_text(text: str) -> list[str]:
+        signal_names: list[str] = []
+        seen_signal_names: set[str] = set()
+        for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(text):
+            signal_name = match.group(1)
+            if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                continue
+            if _is_verilog_numeric_literal_identifier(text, match):
+                continue
+            if signal_name in seen_signal_names:
+                continue
+            seen_signal_names.add(signal_name)
+            signal_names.append(signal_name)
+        return signal_names
+
     def _extract_instantiation_port_bindings(stmt_text: str, inst_name: str, inst_type: str, module_ports: dict[str, list[str]]) -> list[tuple[str, str]]:
         named_bindings = list(VERILOG_NAMED_PORT_BINDING_RE.finditer(stmt_text))
         if named_bindings:
-            return [(match.group(1), match.group(2)) for match in named_bindings]
+            bindings: list[tuple[str, str]] = []
+            for match in named_bindings:
+                port_name = match.group(1)
+                for signal_name in _extract_signal_names_from_text(match.group("expr")):
+                    bindings.append((port_name, signal_name))
+            return bindings
 
         inst_match = re.search(rf"\b{re.escape(inst_name)}\s*\((.*)\)\s*;\s*$", stmt_text, re.DOTALL)
         if inst_match is None:
@@ -1909,13 +1929,8 @@ def extract_verilog(path: Path) -> dict:
         for index, arg_text in enumerate(_split_verilog_top_level_commas(inst_match.group(1))):
             if index >= len(ordered_ports):
                 break
-            signal_match = VERILOG_SIGNAL_IDENTIFIER_RE.fullmatch(arg_text.strip())
-            if signal_match is None:
-                continue
-            signal_name = signal_match.group(1)
-            if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
-                continue
-            bindings.append((ordered_ports[index], signal_name))
+            for signal_name in _extract_signal_names_from_text(arg_text.strip()):
+                bindings.append((ordered_ports[index], signal_name))
         return bindings
 
     def _extract_signal_identifiers(node) -> list[Any]:
@@ -2004,16 +2019,23 @@ def extract_verilog(path: Path) -> dict:
                         expr_node = port_conn.child_by_field_name("expression")
                         if expr_node is None:
                             expr_node = _first_descendant_of_type(port_conn, ("expression",))
-                        signal_ident = _extract_simple_signal_expression_identifier(expr_node)
-                        if port_node is None or signal_ident is None:
+                        signal_idents = _extract_signal_identifiers(expr_node)
+                        if port_node is None or not signal_idents:
                             continue
                         port_name = _read_text(port_node, source).strip()
-                        signal_name = _read_text(signal_ident, source).strip()
-                        signal_nid = _ensure_scope_signal(scope_nid, signal_name, line)
                         endpoint_nid = _make_id(inst_nid, port_name)
                         add_node(endpoint_nid, f"{inst_name}.{port_name}", line)
                         add_edge(inst_nid, endpoint_nid, "has_port_binding", line)
-                        add_edge(signal_nid, endpoint_nid, "binds_port", line)
+                        seen_signal_names: set[str] = set()
+                        for signal_ident in signal_idents:
+                            signal_name = _read_text(signal_ident, source).strip()
+                            if not signal_name or signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            if signal_name in seen_signal_names:
+                                continue
+                            seen_signal_names.add(signal_name)
+                            signal_nid = _ensure_scope_signal(scope_nid, signal_name, line)
+                            add_edge(signal_nid, endpoint_nid, "binds_port", line)
             return
 
     def _extract_local_verilog_calls() -> None:
