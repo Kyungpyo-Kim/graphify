@@ -52,6 +52,18 @@ VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
 VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
 VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_][A-Za-z0-9_$]*)\b")
+VERILOG_PACKAGE_BODY_RE = re.compile(
+    r"\bpackage\s+([A-Za-z_][A-Za-z0-9_$]*)\b\s*;(?P<body>.*?)(?:\bendpackage\b)",
+    re.DOTALL,
+)
+VERILOG_CLASS_BODY_RE = re.compile(
+    r"\bclass\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?:\s+extends\s+([^;]+?))?\s*;(?P<body>.*?)(?:\bendclass\b)",
+    re.DOTALL,
+)
+VERILOG_CLASS_METHOD_RE = re.compile(
+    r"^\s*(?:virtual\s+)?(?P<kind>function|task)\b(?P<header>[^;\n]*?)\((?P<args>.*?)\)\s*;(?P<body>.*?)(?:\bendfunction\b|\bendtask\b)",
+    re.MULTILINE | re.DOTALL,
+)
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
@@ -2082,6 +2094,51 @@ def extract_verilog(path: Path) -> dict:
             add_edge(symbol_nid, pkg_nid, "qualified_by_package", line)
             add_edge(src_nid, symbol_nid, "uses_package_symbol", line)
 
+    def _extract_uvm_package_classes() -> None:
+        masked_text = _mask_verilog_comments_and_strings(source_text)
+        for package_match in VERILOG_PACKAGE_BODY_RE.finditer(masked_text):
+            package_name = package_match.group(1)
+            package_line = source_text.count("\n", 0, package_match.start(1)) + 1
+            package_nid = _make_id(stem, package_name)
+            add_node(package_nid, package_name, package_line)
+            add_edge(file_nid, package_nid, "defines", package_line)
+            scope_ranges.append((package_match.start(), package_match.end(), package_nid, package_line))
+
+            package_body = package_match.group("body")
+            package_offset = package_match.start("body")
+            for class_match in VERILOG_CLASS_BODY_RE.finditer(package_body):
+                class_name = class_match.group(1)
+                base_expr = (class_match.group(2) or "").strip()
+                class_line = source_text.count("\n", 0, package_offset + class_match.start(1)) + 1
+                class_nid = _make_id(package_nid, class_name)
+                add_node(class_nid, class_name, class_line)
+                add_edge(package_nid, class_nid, "contains", class_line)
+                scope_ranges.append((package_offset + class_match.start(), package_offset + class_match.end(), class_nid, class_line))
+
+                if base_expr:
+                    base_name_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", base_expr)
+                    if base_name_match is not None:
+                        base_name = base_name_match.group(1)
+                        base_nid = _make_id(base_name)
+                        add_node(base_nid, base_name, class_line)
+                        add_edge(class_nid, base_nid, "inherits", class_line)
+
+                class_body = class_match.group("body")
+                class_body_offset = package_offset + class_match.start("body")
+                for method_match in VERILOG_CLASS_METHOD_RE.finditer(class_body):
+                    header = method_match.group("header")
+                    name_matches = re.findall(r"([A-Za-z_][A-Za-z0-9_$]*)", header)
+                    if not name_matches:
+                        continue
+                    method_name = name_matches[-1]
+                    method_line = source_text.count("\n", 0, class_body_offset + method_match.start()) + 1
+                    method_nid = _make_id(class_nid, method_name)
+                    label = f"{method_name}()" if method_match.group("kind") == "function" else method_name
+                    add_node(method_nid, label, method_line)
+                    add_edge(class_nid, method_nid, "contains", method_line)
+                    scope_ranges.append((class_body_offset + method_match.start(), class_body_offset + method_match.end(), method_nid, method_line))
+                    _register_local_callable(class_nid, method_name, method_nid, method_match.group(0), method_line)
+
     def _is_verilog_numeric_literal_identifier(text: str, match: re.Match[str]) -> bool:
         start = match.start(1)
         return start >= 2 and text[start - 1] == "'" and text[start - 2].isdigit()
@@ -2094,8 +2151,20 @@ def extract_verilog(path: Path) -> dict:
             and not _is_verilog_numeric_literal_identifier(lhs_text, match)
         ]
 
-    def _select_verilog_lhs_target(lhs_identifiers: Sequence[str]) -> str | None:
-        return lhs_identifiers[0] if lhs_identifiers else None
+    def _select_verilog_lhs_target(lhs_text: str, lhs_identifiers: Sequence[str]) -> str | None:
+        if not lhs_identifiers:
+            return None
+        candidate_text = lhs_text.strip()
+        if "\n" in candidate_text:
+            candidate_text = candidate_text.splitlines()[-1].strip()
+        if ":" in candidate_text:
+            candidate_text = candidate_text.rsplit(":", 1)[-1].strip()
+        target_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", candidate_text)
+        if target_match is not None:
+            target_name = target_match.group(1)
+            if target_name.lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                return target_name
+        return lhs_identifiers[-1]
 
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
@@ -2120,8 +2189,9 @@ def extract_verilog(path: Path) -> dict:
 
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
-                    lhs_identifiers = _extract_verilog_lhs_identifiers(assignment_match.group("lhs"))
-                    lhs_name = _select_verilog_lhs_target(lhs_identifiers)
+                    lhs_text = assignment_match.group("lhs")
+                    lhs_identifiers = _extract_verilog_lhs_identifiers(lhs_text)
+                    lhs_name = _select_verilog_lhs_target(lhs_text, lhs_identifiers)
                     if lhs_name:
                         lhs_signal_nid = _make_id(module_nid, lhs_name)
                         add_node(lhs_signal_nid, lhs_name, line)
@@ -2129,7 +2199,7 @@ def extract_verilog(path: Path) -> dict:
 
                         seen_dependencies: set[str] = set()
                         if procedural_match is not None:
-                            for control_name in lhs_identifiers[1:]:
+                            for control_name in lhs_identifiers:
                                 if control_name == lhs_name or control_name in seen_dependencies:
                                     continue
                                 seen_dependencies.add(control_name)
@@ -2296,6 +2366,7 @@ def extract_verilog(path: Path) -> dict:
                     break
 
     walk(root, top_level_module_nid)
+    _extract_uvm_package_classes()
     _extract_local_verilog_calls()
     _extract_package_qualified_symbol_uses()
     _extract_simple_assign_signal_dependencies()
