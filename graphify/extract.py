@@ -2086,6 +2086,17 @@ def extract_verilog(path: Path) -> dict:
         start = match.start(1)
         return start >= 2 and text[start - 1] == "'" and text[start - 2].isdigit()
 
+    def _extract_verilog_lhs_identifiers(lhs_text: str) -> list[str]:
+        return [
+            match.group(1)
+            for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(lhs_text)
+            if match.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
+            and not _is_verilog_numeric_literal_identifier(lhs_text, match)
+        ]
+
+    def _select_verilog_lhs_target(lhs_identifiers: Sequence[str]) -> str | None:
+        return lhs_identifiers[0] if lhs_identifiers else None
+
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_module_ports = _load_known_verilog_module_ports(path.parent)
@@ -2109,21 +2120,16 @@ def extract_verilog(path: Path) -> dict:
 
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
-                    lhs_identifiers = [
-                        m.group(1)
-                        for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("lhs"))
-                        if m.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
-                        and not _is_verilog_numeric_literal_identifier(assignment_match.group("lhs"), m)
-                    ]
-                    if lhs_identifiers:
-                        lhs_name = lhs_identifiers[-1]
+                    lhs_identifiers = _extract_verilog_lhs_identifiers(assignment_match.group("lhs"))
+                    lhs_name = _select_verilog_lhs_target(lhs_identifiers)
+                    if lhs_name:
                         lhs_signal_nid = _make_id(module_nid, lhs_name)
                         add_node(lhs_signal_nid, lhs_name, line)
                         add_edge(module_nid, lhs_signal_nid, "contains", line)
 
                         seen_dependencies: set[str] = set()
                         if procedural_match is not None:
-                            for control_name in lhs_identifiers[:-1]:
+                            for control_name in lhs_identifiers[1:]:
                                 if control_name == lhs_name or control_name in seen_dependencies:
                                     continue
                                 seen_dependencies.add(control_name)
