@@ -2267,6 +2267,14 @@ def extract_verilog(path: Path) -> dict:
                 add_node(tgt_nid, inst_type, line)
                 add_edge(module_nid, tgt_nid, relation, line, confidence=confidence, score=score)
 
+    def _has_verilog_ancestor_type(node, ancestor_types: Sequence[str]) -> bool:
+        current = getattr(node, "parent", None)
+        while current is not None:
+            if current.type in ancestor_types:
+                return True
+            current = getattr(current, "parent", None)
+        return False
+
     def walk(node, module_nid: str | None = None) -> None:
         t = node.type
 
@@ -2284,36 +2292,42 @@ def extract_verilog(path: Path) -> dict:
                 return
 
         elif t in ("function_declaration", "function_prototype"):
-            name_node = node.child_by_field_name("name")
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("function_identifier",))
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
-            if name_node:
-                func_name = _read_text(name_node, source)
-                line = node.start_point[0] + 1
-                parent = module_nid or file_nid
-                nid = _make_id(parent, func_name)
-                add_node(nid, f"{func_name}()", line)
-                add_edge(parent, nid, "contains", line)
-                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
-                _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
+            if module_nid is None and _has_verilog_ancestor_type(node, ("package_declaration", "class_declaration")):
+                pass
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("function_identifier",))
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
+                if name_node:
+                    func_name = _read_text(name_node, source)
+                    line = node.start_point[0] + 1
+                    parent = module_nid or file_nid
+                    nid = _make_id(parent, func_name)
+                    add_node(nid, f"{func_name}()", line)
+                    add_edge(parent, nid, "contains", line)
+                    scope_ranges.append((node.start_byte, node.end_byte, nid, line))
+                    _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
 
         elif t == "task_declaration":
-            name_node = node.child_by_field_name("name")
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("task_identifier",))
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
-            if name_node:
-                task_name = _read_text(name_node, source)
-                line = node.start_point[0] + 1
-                parent = module_nid or file_nid
-                nid = _make_id(parent, task_name)
-                add_node(nid, task_name, line)
-                add_edge(parent, nid, "contains", line)
-                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
-                _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
+            if module_nid is None and _has_verilog_ancestor_type(node, ("package_declaration", "class_declaration")):
+                pass
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("task_identifier",))
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
+                if name_node:
+                    task_name = _read_text(name_node, source)
+                    line = node.start_point[0] + 1
+                    parent = module_nid or file_nid
+                    nid = _make_id(parent, task_name)
+                    add_node(nid, task_name, line)
+                    add_edge(parent, nid, "contains", line)
+                    scope_ranges.append((node.start_byte, node.end_byte, nid, line))
+                    _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
 
         elif t in VERILOG_SIGNAL_DECLARATION_TYPES:
             if module_nid:
