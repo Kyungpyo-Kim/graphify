@@ -64,6 +64,14 @@ VERILOG_CLASS_METHOD_RE = re.compile(
     r"^\s*(?:virtual\s+)?(?P<kind>function|task)\b(?P<header>[^;\n]*?)\((?P<args>.*?)\)\s*;(?P<body>.*?)(?:\bendfunction\b|\bendtask\b)",
     re.MULTILINE | re.DOTALL,
 )
+VERILOG_CLASS_HEADER_RE = re.compile(
+    r"\bclass\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?:\s+extends\s+([^;]+?))?\s*;",
+    re.DOTALL,
+)
+VERILOG_CLASS_METHOD_HEADER_RE = re.compile(
+    r"^\s*(?:virtual\s+)?(?P<kind>function|task)\b(?P<header>[^;\n]*?)\((?P<args>.*?)\)\s*;",
+    re.MULTILINE | re.DOTALL,
+)
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
@@ -2106,14 +2114,22 @@ def extract_verilog(path: Path) -> dict:
 
             package_body = package_match.group("body")
             package_offset = package_match.start("body")
-            for class_match in VERILOG_CLASS_BODY_RE.finditer(package_body):
+
+            class_cursor = 0
+            while True:
+                class_match = VERILOG_CLASS_HEADER_RE.search(package_body, class_cursor)
+                if class_match is None:
+                    break
+                class_end = package_body.find("endclass", class_match.end())
+                if class_end == -1:
+                    break
                 class_name = class_match.group(1)
                 base_expr = (class_match.group(2) or "").strip()
                 class_line = source_text.count("\n", 0, package_offset + class_match.start(1)) + 1
                 class_nid = _make_id(package_nid, class_name)
                 add_node(class_nid, class_name, class_line)
                 add_edge(package_nid, class_nid, "contains", class_line)
-                scope_ranges.append((package_offset + class_match.start(), package_offset + class_match.end(), class_nid, class_line))
+                scope_ranges.append((package_offset + class_match.start(), package_offset + class_end + len("endclass"), class_nid, class_line))
 
                 if base_expr:
                     base_name_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", base_expr)
@@ -2123,12 +2139,21 @@ def extract_verilog(path: Path) -> dict:
                         add_node(base_nid, base_name, class_line)
                         add_edge(class_nid, base_nid, "inherits", class_line)
 
-                class_body = class_match.group("body")
-                class_body_offset = package_offset + class_match.start("body")
-                for method_match in VERILOG_CLASS_METHOD_RE.finditer(class_body):
+                class_body = package_body[class_match.end():class_end]
+                class_body_offset = package_offset + class_match.end()
+                method_cursor = 0
+                while True:
+                    method_match = VERILOG_CLASS_METHOD_HEADER_RE.search(class_body, method_cursor)
+                    if method_match is None:
+                        break
+                    end_keyword = "endfunction" if method_match.group("kind") == "function" else "endtask"
+                    method_end = class_body.find(end_keyword, method_match.end())
+                    if method_end == -1:
+                        break
                     header = method_match.group("header")
                     name_matches = re.findall(r"([A-Za-z_][A-Za-z0-9_$]*)", header)
                     if not name_matches:
+                        method_cursor = method_end + len(end_keyword)
                         continue
                     method_name = name_matches[-1]
                     method_line = source_text.count("\n", 0, class_body_offset + method_match.start()) + 1
@@ -2136,8 +2161,12 @@ def extract_verilog(path: Path) -> dict:
                     label = f"{method_name}()" if method_match.group("kind") == "function" else method_name
                     add_node(method_nid, label, method_line)
                     add_edge(class_nid, method_nid, "contains", method_line)
-                    scope_ranges.append((class_body_offset + method_match.start(), class_body_offset + method_match.end(), method_nid, method_line))
-                    _register_local_callable(class_nid, method_name, method_nid, method_match.group(0), method_line)
+                    method_text = class_body[method_match.start():method_end + len(end_keyword)]
+                    scope_ranges.append((class_body_offset + method_match.start(), class_body_offset + method_end + len(end_keyword), method_nid, method_line))
+                    _register_local_callable(class_nid, method_name, method_nid, method_text, method_line)
+                    method_cursor = method_end + len(end_keyword)
+
+                class_cursor = class_end + len("endclass")
 
     def _is_verilog_numeric_literal_identifier(text: str, match: re.Match[str]) -> bool:
         start = match.start(1)
