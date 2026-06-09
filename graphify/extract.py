@@ -76,6 +76,19 @@ VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rh
 VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
 VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\((?P<expr>.*?)\)", re.DOTALL)
+VERILOG_UVM_CONFIG_ACCESS_RE = re.compile(
+    r"uvm_config_db\s*#\s*\((?P<cfg_type>.*?)\)\s*::\s*(?P<op>set|get)\s*\((?P<args>.*?)\)\s*(?:;|\))",
+    re.DOTALL,
+)
+VERILOG_UVM_CONNECT_CALL_RE = re.compile(
+    r"(?P<src>[A-Za-z_][A-Za-z0-9_$.]*)\.connect\s*\(\s*(?P<tgt>[A-Za-z_][A-Za-z0-9_$.]*)\s*\)\s*;"
+)
+VERILOG_UVM_SEQUENCE_START_RE = re.compile(
+    r"(?P<seq>[A-Za-z_][A-Za-z0-9_$.]*)\.start\s*\(\s*(?P<sequencer>[A-Za-z_][A-Za-z0-9_$.]*)\s*\)\s*;"
+)
+VERILOG_UVM_RUN_TEST_RE = re.compile(
+    r"\brun_test\s*\(\s*\"(?P<test>[A-Za-z_][A-Za-z0-9_$]*)\"\s*\)\s*;"
+)
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
 VERILOG_SIGNAL_DECLARATION_TYPES = frozenset({
     "ansi_port_declaration",
@@ -2168,6 +2181,59 @@ def extract_verilog(path: Path) -> dict:
 
                 class_cursor = class_end + len("endclass")
 
+    def _extract_uvm_interaction_adapters() -> None:
+        adapter_text = source_text
+
+        def _add_named_target(label: str, line: int, *parts: str) -> str:
+            nid = _make_id(*parts)
+            add_node(nid, label, line)
+            return nid
+
+        for match in VERILOG_UVM_CONFIG_ACCESS_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            args = [part.strip() for part in match.group("args").split(",")]
+            if len(args) < 4:
+                continue
+            field_name = args[2].strip().strip('"')
+            if not field_name:
+                continue
+            cfg_type = " ".join(match.group("cfg_type").split())
+            config_nid = _add_named_target(f"config::{field_name}", line, "uvm_config", field_name)
+            add_edge(src_nid, config_nid, f"uvm_config_{match.group('op')}", line)
+            if cfg_type:
+                type_nid = _add_named_target(cfg_type, line, "uvm_config_type", cfg_type)
+                add_edge(config_nid, type_nid, "typed_as", line)
+
+        for match in VERILOG_UVM_CONNECT_CALL_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            endpoint_src = match.group("src")
+            endpoint_tgt = match.group("tgt")
+            src_endpoint_nid = _add_named_target(endpoint_src, line, src_nid, endpoint_src)
+            tgt_endpoint_nid = _add_named_target(endpoint_tgt, line, src_nid, endpoint_tgt)
+            add_edge(src_nid, src_endpoint_nid, "contains", line)
+            add_edge(src_nid, tgt_endpoint_nid, "contains", line)
+            add_edge(src_endpoint_nid, tgt_endpoint_nid, "connects_to", line)
+
+        for match in VERILOG_UVM_SEQUENCE_START_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            seq_name = match.group("seq")
+            sequencer_name = match.group("sequencer")
+            seq_nid = _add_named_target(seq_name, line, src_nid, seq_name)
+            sequencer_nid = _add_named_target(sequencer_name, line, src_nid, sequencer_name)
+            add_edge(src_nid, seq_nid, "contains", line)
+            add_edge(src_nid, sequencer_nid, "contains", line)
+            add_edge(seq_nid, sequencer_nid, "starts_on", line)
+
+        for match in VERILOG_UVM_RUN_TEST_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            test_name = match.group("test")
+            test_nid = _add_named_target(test_name, line, stem, test_name)
+            add_edge(src_nid, test_nid, "runs_test", line)
+
     def _is_verilog_numeric_literal_identifier(text: str, match: re.Match[str]) -> bool:
         start = match.start(1)
         return start >= 2 and text[start - 1] == "'" and text[start - 2].isdigit()
@@ -2412,6 +2478,7 @@ def extract_verilog(path: Path) -> dict:
     _extract_uvm_package_classes()
     _extract_local_verilog_calls()
     _extract_package_qualified_symbol_uses()
+    _extract_uvm_interaction_adapters()
     _extract_simple_assign_signal_dependencies()
     if root.type == "ERROR" or root.has_error:
         _extract_verilog_text_fallback()
