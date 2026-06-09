@@ -52,10 +52,43 @@ VERILOG_INSTANCE_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)")
 VERILOG_CELL_LIKE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_$]*")
 VERILOG_LOCAL_CALL_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 VERILOG_PACKAGE_SYMBOL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)::([A-Za-z_][A-Za-z0-9_$]*)\b")
+VERILOG_PACKAGE_BODY_RE = re.compile(
+    r"\bpackage\s+([A-Za-z_][A-Za-z0-9_$]*)\b\s*;(?P<body>.*?)(?:\bendpackage\b)",
+    re.DOTALL,
+)
+VERILOG_CLASS_BODY_RE = re.compile(
+    r"\bclass\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?:\s+extends\s+([^;]+?))?\s*;(?P<body>.*?)(?:\bendclass\b)",
+    re.DOTALL,
+)
+VERILOG_CLASS_METHOD_RE = re.compile(
+    r"^\s*(?:virtual\s+)?(?P<kind>function|task)\b(?P<header>[^;\n]*?)\((?P<args>.*?)\)\s*;(?P<body>.*?)(?:\bendfunction\b|\bendtask\b)",
+    re.MULTILINE | re.DOTALL,
+)
+VERILOG_CLASS_HEADER_RE = re.compile(
+    r"\bclass\s+([A-Za-z_][A-Za-z0-9_$]*)\b(?:\s+extends\s+([^;]+?))?\s*;",
+    re.DOTALL,
+)
+VERILOG_CLASS_METHOD_HEADER_RE = re.compile(
+    r"^\s*(?:virtual\s+)?(?P<kind>function|task)\b(?P<header>[^;\n]*?)\((?P<args>.*?)\)\s*;",
+    re.MULTILINE | re.DOTALL,
+)
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
-VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)")
+VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\((?P<expr>.*?)\)", re.DOTALL)
+VERILOG_UVM_CONFIG_ACCESS_RE = re.compile(
+    r"uvm_config_db\s*#\s*\((?P<cfg_type>.*?)\)\s*::\s*(?P<op>set|get)\s*\((?P<args>.*?)\)\s*(?:;|\))",
+    re.DOTALL,
+)
+VERILOG_UVM_CONNECT_CALL_RE = re.compile(
+    r"(?P<src>[A-Za-z_][A-Za-z0-9_$.]*)\.connect\s*\(\s*(?P<tgt>[A-Za-z_][A-Za-z0-9_$.]*)\s*\)\s*;"
+)
+VERILOG_UVM_SEQUENCE_START_RE = re.compile(
+    r"(?P<seq>[A-Za-z_][A-Za-z0-9_$.]*)\.start\s*\(\s*(?P<sequencer>[A-Za-z_][A-Za-z0-9_$.]*)\s*\)\s*;"
+)
+VERILOG_UVM_RUN_TEST_RE = re.compile(
+    r"\brun_test\s*\(\s*\"(?P<test>[A-Za-z_][A-Za-z0-9_$]*)\"\s*\)\s*;"
+)
 VERILOG_EXTERNAL_REFERENCE_RELATION = "references_unresolved_module"
 VERILOG_SIGNAL_DECLARATION_TYPES = frozenset({
     "ansi_port_declaration",
@@ -1893,10 +1926,30 @@ def extract_verilog(path: Path) -> dict:
             parts.append(tail)
         return parts
 
+    def _extract_signal_names_from_text(text: str) -> list[str]:
+        signal_names: list[str] = []
+        seen_signal_names: set[str] = set()
+        for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(text):
+            signal_name = match.group(1)
+            if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                continue
+            if _is_verilog_numeric_literal_identifier(text, match):
+                continue
+            if signal_name in seen_signal_names:
+                continue
+            seen_signal_names.add(signal_name)
+            signal_names.append(signal_name)
+        return signal_names
+
     def _extract_instantiation_port_bindings(stmt_text: str, inst_name: str, inst_type: str, module_ports: dict[str, list[str]]) -> list[tuple[str, str]]:
         named_bindings = list(VERILOG_NAMED_PORT_BINDING_RE.finditer(stmt_text))
         if named_bindings:
-            return [(match.group(1), match.group(2)) for match in named_bindings]
+            bindings: list[tuple[str, str]] = []
+            for match in named_bindings:
+                port_name = match.group(1)
+                for signal_name in _extract_signal_names_from_text(match.group("expr")):
+                    bindings.append((port_name, signal_name))
+            return bindings
 
         inst_match = re.search(rf"\b{re.escape(inst_name)}\s*\((.*)\)\s*;\s*$", stmt_text, re.DOTALL)
         if inst_match is None:
@@ -1909,13 +1962,8 @@ def extract_verilog(path: Path) -> dict:
         for index, arg_text in enumerate(_split_verilog_top_level_commas(inst_match.group(1))):
             if index >= len(ordered_ports):
                 break
-            signal_match = VERILOG_SIGNAL_IDENTIFIER_RE.fullmatch(arg_text.strip())
-            if signal_match is None:
-                continue
-            signal_name = signal_match.group(1)
-            if signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
-                continue
-            bindings.append((ordered_ports[index], signal_name))
+            for signal_name in _extract_signal_names_from_text(arg_text.strip()):
+                bindings.append((ordered_ports[index], signal_name))
         return bindings
 
     def _extract_signal_identifiers(node) -> list[Any]:
@@ -2004,16 +2052,23 @@ def extract_verilog(path: Path) -> dict:
                         expr_node = port_conn.child_by_field_name("expression")
                         if expr_node is None:
                             expr_node = _first_descendant_of_type(port_conn, ("expression",))
-                        signal_ident = _extract_simple_signal_expression_identifier(expr_node)
-                        if port_node is None or signal_ident is None:
+                        signal_idents = _extract_signal_identifiers(expr_node)
+                        if port_node is None or not signal_idents:
                             continue
                         port_name = _read_text(port_node, source).strip()
-                        signal_name = _read_text(signal_ident, source).strip()
-                        signal_nid = _ensure_scope_signal(scope_nid, signal_name, line)
                         endpoint_nid = _make_id(inst_nid, port_name)
                         add_node(endpoint_nid, f"{inst_name}.{port_name}", line)
                         add_edge(inst_nid, endpoint_nid, "has_port_binding", line)
-                        add_edge(signal_nid, endpoint_nid, "binds_port", line)
+                        seen_signal_names: set[str] = set()
+                        for signal_ident in signal_idents:
+                            signal_name = _read_text(signal_ident, source).strip()
+                            if not signal_name or signal_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            if signal_name in seen_signal_names:
+                                continue
+                            seen_signal_names.add(signal_name)
+                            signal_nid = _ensure_scope_signal(scope_nid, signal_name, line)
+                            add_edge(signal_nid, endpoint_nid, "binds_port", line)
             return
 
     def _extract_local_verilog_calls() -> None:
@@ -2060,6 +2115,152 @@ def extract_verilog(path: Path) -> dict:
             add_edge(symbol_nid, pkg_nid, "qualified_by_package", line)
             add_edge(src_nid, symbol_nid, "uses_package_symbol", line)
 
+    def _extract_uvm_package_classes() -> None:
+        masked_text = _mask_verilog_comments_and_strings(source_text)
+        for package_match in VERILOG_PACKAGE_BODY_RE.finditer(masked_text):
+            package_name = package_match.group(1)
+            package_line = source_text.count("\n", 0, package_match.start(1)) + 1
+            package_nid = _make_id(stem, package_name)
+            add_node(package_nid, package_name, package_line)
+            add_edge(file_nid, package_nid, "defines", package_line)
+            scope_ranges.append((package_match.start(), package_match.end(), package_nid, package_line))
+
+            package_body = package_match.group("body")
+            package_offset = package_match.start("body")
+
+            class_cursor = 0
+            while True:
+                class_match = VERILOG_CLASS_HEADER_RE.search(package_body, class_cursor)
+                if class_match is None:
+                    break
+                class_end = package_body.find("endclass", class_match.end())
+                if class_end == -1:
+                    break
+                class_name = class_match.group(1)
+                base_expr = (class_match.group(2) or "").strip()
+                class_line = source_text.count("\n", 0, package_offset + class_match.start(1)) + 1
+                class_nid = _make_id(package_nid, class_name)
+                add_node(class_nid, class_name, class_line)
+                add_edge(package_nid, class_nid, "contains", class_line)
+                scope_ranges.append((package_offset + class_match.start(), package_offset + class_end + len("endclass"), class_nid, class_line))
+
+                if base_expr:
+                    base_name_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", base_expr)
+                    if base_name_match is not None:
+                        base_name = base_name_match.group(1)
+                        base_nid = _make_id(base_name)
+                        add_node(base_nid, base_name, class_line)
+                        add_edge(class_nid, base_nid, "inherits", class_line)
+
+                class_body = package_body[class_match.end():class_end]
+                class_body_offset = package_offset + class_match.end()
+                method_cursor = 0
+                while True:
+                    method_match = VERILOG_CLASS_METHOD_HEADER_RE.search(class_body, method_cursor)
+                    if method_match is None:
+                        break
+                    end_keyword = "endfunction" if method_match.group("kind") == "function" else "endtask"
+                    method_end = class_body.find(end_keyword, method_match.end())
+                    if method_end == -1:
+                        break
+                    header = method_match.group("header")
+                    name_matches = re.findall(r"([A-Za-z_][A-Za-z0-9_$]*)", header)
+                    if not name_matches:
+                        method_cursor = method_end + len(end_keyword)
+                        continue
+                    method_name = name_matches[-1]
+                    method_line = source_text.count("\n", 0, class_body_offset + method_match.start()) + 1
+                    method_nid = _make_id(class_nid, method_name)
+                    label = f"{method_name}()" if method_match.group("kind") == "function" else method_name
+                    add_node(method_nid, label, method_line)
+                    add_edge(class_nid, method_nid, "contains", method_line)
+                    method_text = class_body[method_match.start():method_end + len(end_keyword)]
+                    scope_ranges.append((class_body_offset + method_match.start(), class_body_offset + method_end + len(end_keyword), method_nid, method_line))
+                    _register_local_callable(class_nid, method_name, method_nid, method_text, method_line)
+                    method_cursor = method_end + len(end_keyword)
+
+                class_cursor = class_end + len("endclass")
+
+    def _extract_uvm_interaction_adapters() -> None:
+        adapter_text = source_text
+
+        def _add_named_target(label: str, line: int, *parts: str) -> str:
+            nid = _make_id(*parts)
+            add_node(nid, label, line)
+            return nid
+
+        for match in VERILOG_UVM_CONFIG_ACCESS_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            args = [part.strip() for part in match.group("args").split(",")]
+            if len(args) < 4:
+                continue
+            field_name = args[2].strip().strip('"')
+            if not field_name:
+                continue
+            cfg_type = " ".join(match.group("cfg_type").split())
+            config_nid = _add_named_target(f"config::{field_name}", line, "uvm_config", field_name)
+            add_edge(src_nid, config_nid, f"uvm_config_{match.group('op')}", line)
+            if cfg_type:
+                type_nid = _add_named_target(cfg_type, line, "uvm_config_type", cfg_type)
+                add_edge(config_nid, type_nid, "typed_as", line)
+
+        for match in VERILOG_UVM_CONNECT_CALL_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            endpoint_src = match.group("src")
+            endpoint_tgt = match.group("tgt")
+            src_endpoint_nid = _add_named_target(endpoint_src, line, src_nid, endpoint_src)
+            tgt_endpoint_nid = _add_named_target(endpoint_tgt, line, src_nid, endpoint_tgt)
+            add_edge(src_nid, src_endpoint_nid, "contains", line)
+            add_edge(src_nid, tgt_endpoint_nid, "contains", line)
+            add_edge(src_endpoint_nid, tgt_endpoint_nid, "connects_to", line)
+
+        for match in VERILOG_UVM_SEQUENCE_START_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            seq_name = match.group("seq")
+            sequencer_name = match.group("sequencer")
+            seq_nid = _add_named_target(seq_name, line, src_nid, seq_name)
+            sequencer_nid = _add_named_target(sequencer_name, line, src_nid, sequencer_name)
+            add_edge(src_nid, seq_nid, "contains", line)
+            add_edge(src_nid, sequencer_nid, "contains", line)
+            add_edge(seq_nid, sequencer_nid, "starts_on", line)
+
+        for match in VERILOG_UVM_RUN_TEST_RE.finditer(adapter_text):
+            src_nid, _src_line = _resolve_scope_for_byte(match.start())
+            line = source_text.count("\n", 0, match.start()) + 1
+            test_name = match.group("test")
+            test_nid = _add_named_target(test_name, line, stem, test_name)
+            add_edge(src_nid, test_nid, "runs_test", line)
+
+    def _is_verilog_numeric_literal_identifier(text: str, match: re.Match[str]) -> bool:
+        start = match.start(1)
+        return start >= 2 and text[start - 1] == "'" and text[start - 2].isdigit()
+
+    def _extract_verilog_lhs_identifiers(lhs_text: str) -> list[str]:
+        return [
+            match.group(1)
+            for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(lhs_text)
+            if match.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
+            and not _is_verilog_numeric_literal_identifier(lhs_text, match)
+        ]
+
+    def _select_verilog_lhs_target(lhs_text: str, lhs_identifiers: Sequence[str]) -> str | None:
+        if not lhs_identifiers:
+            return None
+        candidate_text = lhs_text.strip()
+        if "\n" in candidate_text:
+            candidate_text = candidate_text.splitlines()[-1].strip()
+        if ":" in candidate_text:
+            candidate_text = candidate_text.rsplit(":", 1)[-1].strip()
+        target_match = re.match(r"([A-Za-z_][A-Za-z0-9_$]*)", candidate_text)
+        if target_match is not None:
+            target_name = target_match.group(1)
+            if target_name.lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                return target_name
+        return lhs_identifiers[-1]
+
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_module_ports = _load_known_verilog_module_ports(path.parent)
@@ -2083,20 +2284,17 @@ def extract_verilog(path: Path) -> dict:
 
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
-                    lhs_identifiers = [
-                        m.group(1)
-                        for m in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("lhs"))
-                        if m.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
-                    ]
-                    if lhs_identifiers:
-                        lhs_name = lhs_identifiers[-1]
+                    lhs_text = assignment_match.group("lhs")
+                    lhs_identifiers = _extract_verilog_lhs_identifiers(lhs_text)
+                    lhs_name = _select_verilog_lhs_target(lhs_text, lhs_identifiers)
+                    if lhs_name:
                         lhs_signal_nid = _make_id(module_nid, lhs_name)
                         add_node(lhs_signal_nid, lhs_name, line)
                         add_edge(module_nid, lhs_signal_nid, "contains", line)
 
                         seen_dependencies: set[str] = set()
                         if procedural_match is not None:
-                            for control_name in lhs_identifiers[:-1]:
+                            for control_name in lhs_identifiers:
                                 if control_name == lhs_name or control_name in seen_dependencies:
                                     continue
                                 seen_dependencies.add(control_name)
@@ -2110,6 +2308,8 @@ def extract_verilog(path: Path) -> dict:
                             if rhs_name == lhs_name or rhs_name in seen_dependencies:
                                 continue
                             if rhs_name.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                                continue
+                            if _is_verilog_numeric_literal_identifier(assignment_match.group("rhs"), rhs_match):
                                 continue
                             seen_dependencies.add(rhs_name)
                             rhs_signal_nid = _make_id(module_nid, rhs_name)
@@ -2162,6 +2362,14 @@ def extract_verilog(path: Path) -> dict:
                 add_node(tgt_nid, inst_type, line)
                 add_edge(module_nid, tgt_nid, relation, line, confidence=confidence, score=score)
 
+    def _has_verilog_ancestor_type(node, ancestor_types: Sequence[str]) -> bool:
+        current = getattr(node, "parent", None)
+        while current is not None:
+            if current.type in ancestor_types:
+                return True
+            current = getattr(current, "parent", None)
+        return False
+
     def walk(node, module_nid: str | None = None) -> None:
         t = node.type
 
@@ -2179,36 +2387,42 @@ def extract_verilog(path: Path) -> dict:
                 return
 
         elif t in ("function_declaration", "function_prototype"):
-            name_node = node.child_by_field_name("name")
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("function_identifier",))
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
-            if name_node:
-                func_name = _read_text(name_node, source)
-                line = node.start_point[0] + 1
-                parent = module_nid or file_nid
-                nid = _make_id(parent, func_name)
-                add_node(nid, f"{func_name}()", line)
-                add_edge(parent, nid, "contains", line)
-                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
-                _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
+            if module_nid is None and _has_verilog_ancestor_type(node, ("package_declaration", "class_declaration")):
+                pass
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("function_identifier",))
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
+                if name_node:
+                    func_name = _read_text(name_node, source)
+                    line = node.start_point[0] + 1
+                    parent = module_nid or file_nid
+                    nid = _make_id(parent, func_name)
+                    add_node(nid, f"{func_name}()", line)
+                    add_edge(parent, nid, "contains", line)
+                    scope_ranges.append((node.start_byte, node.end_byte, nid, line))
+                    _register_local_callable(parent, func_name, nid, _read_text(node, source), line)
 
         elif t == "task_declaration":
-            name_node = node.child_by_field_name("name")
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("task_identifier",))
-            if name_node is None:
-                name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
-            if name_node:
-                task_name = _read_text(name_node, source)
-                line = node.start_point[0] + 1
-                parent = module_nid or file_nid
-                nid = _make_id(parent, task_name)
-                add_node(nid, task_name, line)
-                add_edge(parent, nid, "contains", line)
-                scope_ranges.append((node.start_byte, node.end_byte, nid, line))
-                _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
+            if module_nid is None and _has_verilog_ancestor_type(node, ("package_declaration", "class_declaration")):
+                pass
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("task_identifier",))
+                if name_node is None:
+                    name_node = _first_descendant_of_type(node, ("simple_identifier", "escaped_identifier"))
+                if name_node:
+                    task_name = _read_text(name_node, source)
+                    line = node.start_point[0] + 1
+                    parent = module_nid or file_nid
+                    nid = _make_id(parent, task_name)
+                    add_node(nid, task_name, line)
+                    add_edge(parent, nid, "contains", line)
+                    scope_ranges.append((node.start_byte, node.end_byte, nid, line))
+                    _register_local_callable(parent, task_name, nid, _read_text(node, source), line)
 
         elif t in VERILOG_SIGNAL_DECLARATION_TYPES:
             if module_nid:
@@ -2261,8 +2475,10 @@ def extract_verilog(path: Path) -> dict:
                     break
 
     walk(root, top_level_module_nid)
+    _extract_uvm_package_classes()
     _extract_local_verilog_calls()
     _extract_package_qualified_symbol_uses()
+    _extract_uvm_interaction_adapters()
     _extract_simple_assign_signal_dependencies()
     if root.type == "ERROR" or root.has_error:
         _extract_verilog_text_fallback()
