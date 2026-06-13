@@ -127,6 +127,7 @@ VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES = (
     "parameter ",
     "typedef ",
 )
+VERILOG_LEADING_LOOP_RE = re.compile(r"^for\s*\(", re.IGNORECASE)
 
 
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
@@ -2261,6 +2262,26 @@ def extract_verilog(path: Path) -> dict:
                 return target_name
         return lhs_identifiers[-1]
 
+    def _strip_leading_verilog_for_loop(stmt_text: str) -> str:
+        stripped = stmt_text.lstrip()
+        if not VERILOG_LEADING_LOOP_RE.match(stripped):
+            return stmt_text
+
+        open_paren = stripped.find("(")
+        if open_paren == -1:
+            return stmt_text
+
+        depth = 0
+        for index in range(open_paren, len(stripped)):
+            ch = stripped[index]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return stripped[index + 1 :].lstrip()
+        return stmt_text
+
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
         known_module_ports = _load_known_verilog_module_ports(path.parent)
@@ -2276,11 +2297,13 @@ def extract_verilog(path: Path) -> dict:
 
                 assign_match = VERILOG_SIMPLE_ASSIGN_RE.search(stmt_text)
                 procedural_match = None
+                procedural_stmt_text = stmt_text
                 if assign_match is None:
                     stripped_stmt = stmt_text.strip()
                     lowered_stmt = stripped_stmt.lower()
                     if not any(lowered_stmt.startswith(prefix) for prefix in VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES):
-                        procedural_match = VERILOG_PROCEDURAL_ASSIGN_RE.search(stmt_text)
+                        procedural_stmt_text = _strip_leading_verilog_for_loop(stmt_text)
+                        procedural_match = VERILOG_PROCEDURAL_ASSIGN_RE.search(procedural_stmt_text)
 
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
