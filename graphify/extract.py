@@ -2267,6 +2267,18 @@ def extract_verilog(path: Path) -> dict:
                 return target_name
         return lhs_identifiers[-1]
 
+    def _extract_foreach_index_identifiers(header_text: str) -> set[str]:
+        index_identifiers: set[str] = set()
+        for bracket_text in re.findall(r"\[([^\]]+)\]", header_text):
+            for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(bracket_text):
+                identifier = match.group(1)
+                if identifier.lower() in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS:
+                    continue
+                if _is_verilog_numeric_literal_identifier(bracket_text, match):
+                    continue
+                index_identifiers.add(identifier)
+        return index_identifiers
+
     def _strip_leading_verilog_loop_wrapper(stmt_text: str) -> tuple[str, set[str]]:
         stripped = stmt_text.lstrip()
         excluded_identifiers: set[str] = set()
@@ -2295,9 +2307,7 @@ def extract_verilog(path: Path) -> dict:
                 if depth == 0:
                     header_text = stripped[: index + 1]
                     if header_text.lower().startswith("foreach"):
-                        header_identifiers = _extract_verilog_lhs_identifiers(header_text)
-                        if len(header_identifiers) > 1:
-                            excluded_identifiers.update(header_identifiers[1:])
+                        excluded_identifiers.update(_extract_foreach_index_identifiers(header_text))
                     return stripped[index + 1 :].lstrip(), excluded_identifiers
         return stmt_text, excluded_identifiers
 
@@ -2324,10 +2334,22 @@ def extract_verilog(path: Path) -> dict:
                     if not any(lowered_stmt.startswith(prefix) for prefix in VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES):
                         procedural_stmt_text, excluded_procedural_identifiers = _strip_leading_verilog_loop_wrapper(stmt_text)
                         procedural_match = VERILOG_PROCEDURAL_ASSIGN_RE.search(procedural_stmt_text)
+                        if procedural_match is not None:
+                            header_prefix = procedural_stmt_text[: procedural_match.start()]
+                            for foreach_match in re.finditer(r"foreach\s*\([^)]*\)", header_prefix, re.IGNORECASE):
+                                excluded_procedural_identifiers.update(
+                                    _extract_foreach_index_identifiers(foreach_match.group(0))
+                                )
 
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
                     lhs_text = assignment_match.group("lhs")
+                    if procedural_match is not None and "foreach" in lhs_text.lower():
+                        for foreach_match in re.finditer(r"foreach\s*\([^)]*\)", lhs_text, re.IGNORECASE):
+                            excluded_procedural_identifiers.update(
+                                _extract_foreach_index_identifiers(foreach_match.group(0))
+                            )
+                        lhs_text = re.sub(r".*foreach\s*\([^)]*\)", "", lhs_text, count=1, flags=re.IGNORECASE).strip()
                     lhs_identifiers = _extract_verilog_lhs_identifiers(lhs_text)
                     lhs_name = _select_verilog_lhs_target(lhs_text, lhs_identifiers)
                     if lhs_name:
