@@ -2279,19 +2279,31 @@ def extract_verilog(path: Path) -> dict:
                 index_identifiers.add(identifier)
         return index_identifiers
 
-    def _strip_leading_verilog_loop_wrapper(stmt_text: str) -> tuple[str, set[str]]:
+    def _extract_verilog_control_identifiers(control_text: str) -> set[str]:
+        return {
+            match.group(1)
+            for match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(control_text)
+            if match.group(1).lower() not in SYSTEMVERILOG_FALLBACK_BLOCKED_KEYWORDS
+            and not _is_verilog_numeric_literal_identifier(control_text, match)
+        }
+
+    def _strip_leading_verilog_loop_wrapper(stmt_text: str) -> tuple[str, set[str], set[str]]:
         stripped = stmt_text.lstrip()
         excluded_identifiers: set[str] = set()
+        control_identifiers: set[str] = set()
 
         if VERILOG_DO_WHILE_PREFIX_RE.match(stripped):
             stripped = VERILOG_DO_WHILE_PREFIX_RE.sub("", stripped, count=1).lstrip()
             while stripped.endswith(";"):
                 stripped = stripped[:-1].rstrip()
-            stripped = VERILOG_DO_WHILE_SUFFIX_RE.sub("", stripped).rstrip()
-            return stripped, excluded_identifiers
+            suffix_match = VERILOG_DO_WHILE_SUFFIX_RE.search(stripped)
+            if suffix_match is not None:
+                control_identifiers.update(_extract_verilog_control_identifiers(suffix_match.group(0)))
+                stripped = stripped[: suffix_match.start()].rstrip()
+            return stripped, excluded_identifiers, control_identifiers
 
         if not VERILOG_LEADING_LOOP_HEADER_RE.match(stripped):
-            return stmt_text, excluded_identifiers
+            return stmt_text, excluded_identifiers, control_identifiers
 
         open_paren = stripped.find("(")
         if open_paren == -1:
@@ -2306,10 +2318,11 @@ def extract_verilog(path: Path) -> dict:
                 depth -= 1
                 if depth == 0:
                     header_text = stripped[: index + 1]
+                    control_identifiers.update(_extract_verilog_control_identifiers(header_text))
                     if header_text.lower().startswith("foreach"):
                         excluded_identifiers.update(_extract_foreach_index_identifiers(header_text))
-                    return stripped[index + 1 :].lstrip(), excluded_identifiers
-        return stmt_text, excluded_identifiers
+                    return stripped[index + 1 :].lstrip(), excluded_identifiers, control_identifiers
+        return stmt_text, excluded_identifiers, control_identifiers
 
     def _extract_simple_assign_signal_dependencies() -> None:
         masked_text = _mask_verilog_comments_and_strings(source_text)
@@ -2320,7 +2333,8 @@ def extract_verilog(path: Path) -> dict:
             body_offset = module_match.start("body")
             module_nid = _make_id(stem, mod_name)
 
-            for stmt_match in VERILOG_STATEMENT_RE.finditer(body):
+            stmt_matches = list(VERILOG_STATEMENT_RE.finditer(body))
+            for stmt_index, stmt_match in enumerate(stmt_matches):
                 stmt_text = stmt_match.group(0)
                 line = source_text.count("\n", 0, body_offset + stmt_match.start()) + 1
 
@@ -2328,11 +2342,21 @@ def extract_verilog(path: Path) -> dict:
                 procedural_match = None
                 procedural_stmt_text = stmt_text
                 excluded_procedural_identifiers: set[str] = set()
+                procedural_control_identifiers: set[str] = set()
                 if assign_match is None:
                     stripped_stmt = stmt_text.strip()
                     lowered_stmt = stripped_stmt.lower()
+                    if re.search(r"\bdo\b", stripped_stmt, re.IGNORECASE) and stmt_index + 1 < len(stmt_matches):
+                        next_stmt_text = stmt_matches[stmt_index + 1].group(0).strip()
+                        if next_stmt_text.lower().startswith("while"):
+                            procedural_control_identifiers.update(_extract_verilog_control_identifiers(next_stmt_text))
                     if not any(lowered_stmt.startswith(prefix) for prefix in VERILOG_PROCEDURAL_ASSIGN_BLOCKED_PREFIXES):
-                        procedural_stmt_text, excluded_procedural_identifiers = _strip_leading_verilog_loop_wrapper(stmt_text)
+                        (
+                            procedural_stmt_text,
+                            excluded_procedural_identifiers,
+                            stripped_control_identifiers,
+                        ) = _strip_leading_verilog_loop_wrapper(stmt_text)
+                        procedural_control_identifiers.update(stripped_control_identifiers)
                         procedural_match = VERILOG_PROCEDURAL_ASSIGN_RE.search(procedural_stmt_text)
                         if procedural_match is not None:
                             header_prefix = procedural_stmt_text[: procedural_match.start()]
@@ -2359,7 +2383,7 @@ def extract_verilog(path: Path) -> dict:
 
                         seen_dependencies: set[str] = set()
                         if procedural_match is not None:
-                            for control_name in lhs_identifiers:
+                            for control_name in [*procedural_control_identifiers, *lhs_identifiers]:
                                 if (
                                     control_name == lhs_name
                                     or control_name in seen_dependencies
