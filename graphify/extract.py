@@ -73,7 +73,10 @@ VERILOG_CLASS_METHOD_HEADER_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 VERILOG_SIMPLE_ASSIGN_RE = re.compile(r"\bassign\s+(?P<lhs>[^=;]+?)\s*=\s*(?P<rhs>.*?);", re.DOTALL)
-VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(r"(?P<lhs>[^<>=;]+?)\s*(?P<op><=|=)\s*(?P<rhs>.*?);", re.DOTALL)
+VERILOG_PROCEDURAL_ASSIGN_RE = re.compile(
+    r"(?P<lhs>[^;]+?)\s*(?P<op><<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<=|=)\s*(?P<rhs>.*?);",
+    re.DOTALL,
+)
 VERILOG_SIGNAL_IDENTIFIER_RE = re.compile(r"(?<![.$:])\b([A-Za-z_][A-Za-z0-9_$]*)\b")
 VERILOG_NAMED_PORT_BINDING_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\((?P<expr>.*?)\)", re.DOTALL)
 VERILOG_UVM_CONFIG_ACCESS_RE = re.compile(
@@ -2368,6 +2371,7 @@ def extract_verilog(path: Path) -> dict:
                 assignment_match = assign_match or procedural_match
                 if assignment_match:
                     lhs_text = assignment_match.group("lhs")
+                    assignment_op = assignment_match.groupdict().get("op", "=")
                     if procedural_match is not None and "foreach" in lhs_text.lower():
                         for foreach_match in re.finditer(r"foreach\s*\([^)]*\)", lhs_text, re.IGNORECASE):
                             excluded_procedural_identifiers.update(
@@ -2395,6 +2399,9 @@ def extract_verilog(path: Path) -> dict:
                                 add_node(control_signal_nid, control_name, line)
                                 add_edge(module_nid, control_signal_nid, "contains", line)
                                 add_edge(control_signal_nid, lhs_signal_nid, "assigns_to", line)
+
+                        if procedural_match is not None and assignment_op != "=":
+                            add_edge(lhs_signal_nid, lhs_signal_nid, "assigns_to", line)
 
                         for rhs_match in VERILOG_SIGNAL_IDENTIFIER_RE.finditer(assignment_match.group("rhs")):
                             rhs_name = rhs_match.group(1)
